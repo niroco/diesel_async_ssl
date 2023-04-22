@@ -1,81 +1,107 @@
-use diesel_async::pooled_connection::bb8;
-use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+use diesel::ConnectionResult;
 use diesel_async::AsyncPgConnection;
-use diesel_async::RunQueryDsl;
-use futures_util::FutureExt;
-use futures_util::TryFutureExt;
+use futures::{future, TryFutureExt};
+use tracing::debug;
+use tracing::warn;
 
 #[derive(Debug, thiserror::Error)]
-pub enum Error {
-    #[error("Diesel: {0}")]
-    Db(#[from] diesel::result::Error),
+pub enum CertError {
+    #[error("no PEM encoded data found in provided source")]
+    Missing,
 
-    #[error("Database pool: {0}")]
-    Pool(#[from] diesel_async::pooled_connection::PoolError),
+    #[error("Failed to read PEM certificate: {0}")]
+    Io(std::io::Error),
 
-    #[error("Database connection: {0}")]
-    Connection(#[from] bb8::RunError),
+    #[error("Expected to parse X509-certificate, but found {0}")]
+    WrongPEMKind(&'static str),
 }
 
-pub struct Pool {
-    pool: bb8::Pool<diesel_async::AsyncPgConnection>,
+#[derive(Default)]
+pub struct SslManager {
+    root_certs: Vec<rustls::Certificate>,
 }
 
-impl Pool {
-    pub fn no_connections(&self) -> u32 {
-        self.pool.state().connections
+impl SslManager {
+    /// Adds a X509 certificate in PEM format
+    pub fn add_root_pem_cert(&mut self, pem_cert: &str) -> Result<(), CertError> {
+        let mut bs = pem_cert.as_bytes();
+
+        match rustls_pemfile::read_one(&mut bs) {
+            Ok(Some(rustls_pemfile::Item::X509Certificate(bs))) => {
+                self.root_certs.push(rustls::Certificate(bs));
+                Ok(())
+            }
+            Ok(Some(rustls_pemfile::Item::RSAKey(_))) => Err(CertError::WrongPEMKind("RSAKey")),
+            Ok(Some(rustls_pemfile::Item::PKCS8Key(_))) => Err(CertError::WrongPEMKind("PKCS8Key")),
+            Ok(Some(rustls_pemfile::Item::ECKey(_))) => Err(CertError::WrongPEMKind("ECKey")),
+            Ok(Some(_)) => Err(CertError::WrongPEMKind("other")),
+            Ok(None) => Err(CertError::Missing),
+
+            Err(err) => Err(CertError::Io(err)),
+        }
     }
-}
 
-pub async fn connect(url: &str) -> Result<Pool, Error> {
-    //let manager = AsyncDieselConnectionManager::<diesel_async::AsyncPgConnection>::new(url);
-    let manager = AsyncDieselConnectionManager::<diesel_async::AsyncPgConnection>::new_with_setup(
-        url,
-        |url| {
-            println!("URL: {url}");
+    pub fn add_root_cert(&mut self, cert: rustls::Certificate) {
+        self.root_certs.push(cert);
+    }
+
+    pub fn into_setup(
+        self,
+    ) -> impl Fn(&str) -> future::BoxFuture<'_, ConnectionResult<diesel_async::AsyncPgConnection>>
+           + Send
+           + Sync
+           + 'static {
+        move |url| {
+            println!("Connecting to: {url}");
+
+            let mut cert_store = rustls::RootCertStore::empty();
+
+            for cert in &self.root_certs {
+                cert_store.add(cert).expect("Adding cert"); // Parsed with rustls_pem
+            }
+
             let config = rustls::ClientConfig::builder()
                 .with_safe_defaults()
-                .with_root_certificates(rustls::RootCertStore::empty())
+                .with_root_certificates(cert_store.clone())
                 .with_no_client_auth();
+
             let tls = tokio_postgres_rustls::MakeRustlsConnect::new(config);
 
             // En error for mycket
-            let fut = tokio_postgres::connect(url, tls).map_ok(|(client, conn)| {
-                let client = AsyncPgConnection::try_from(client);
+            let fut = tokio_postgres::connect(url, tls)
+                .map_err(|err| diesel::ConnectionError::BadConnection(err.to_string()))
+                .and_then(|(client, conn)| {
+                    tokio::spawn(async move {
+                        if let Err(err) = conn.await {
+                            warn!("SSL: {err}");
+                        } else {
+                            debug!("stopping ssl connection");
+                        }
+                    });
 
-                client
-            });
+                    AsyncPgConnection::try_from(client)
+                        .map_err(|err| {
+                            println!("Failed to convert to AsyncPgConnection: {err}");
+                            err
+                        })
+                        .map_ok(|conn| {
+                            println!("Converted client to AsyncPgConnection");
+                            conn
+                        })
+                });
 
+            println!("returning boxed future.");
             Box::pin(fut)
-        },
-    );
-
-    let pool = bb8::Pool::builder().build(manager).await?;
-
-    {
-        let _conn = pool.get().await?;
-    }
-
-    Ok(Pool { pool })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn establish_connection() {
-        let db_url = std::env::var("DATABASE_URL").expect("DB url must be set");
-        let pool = super::connect(&db_url).await.expect("connecting");
-
-        assert_eq!(pool.no_connections(), 1);
-
-        //let config = rustls::ClientConfig::builder()
-        //    .with_safe_defaults()
-        //    .with_root_certificates(rustls::RootCertStore::empty())
-        //    .with_no_client_auth();
-        //let tls = tokio_postgres_rustls::MakeRustlsConnect::new(config);
-        //let connect_fut =
-        // tokio_postgres::connect("sslmode=require host=localhost user=postgres", tls);
+        }
     }
 }
+
+// pub trait WithSsl {
+//     fn new_with_ssl(url: &str, ssl_manager: SslManager) -> Self;
+// }
+//
+// impl WithSsl for AsyncDieselConnectionManager<AsyncPgConnection> {
+//     fn new_with_ssl(url: &str, ssl_manager: SslManager) -> Self {
+//         Self::new_with_setup(url, ssl_manager.setup_fn())
+//     }
+// }
