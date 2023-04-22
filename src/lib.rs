@@ -52,8 +52,6 @@ impl SslManager {
            + Sync
            + 'static {
         move |url| {
-            println!("Connecting to: {url}");
-
             let mut cert_store = rustls::RootCertStore::empty();
 
             for cert in &self.root_certs {
@@ -80,17 +78,8 @@ impl SslManager {
                     });
 
                     AsyncPgConnection::try_from(client)
-                        .map_err(|err| {
-                            println!("Failed to convert to AsyncPgConnection: {err}");
-                            err
-                        })
-                        .map_ok(|conn| {
-                            println!("Converted client to AsyncPgConnection");
-                            conn
-                        })
                 });
 
-            println!("returning boxed future.");
             Box::pin(fut)
         }
     }
