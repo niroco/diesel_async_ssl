@@ -1,6 +1,6 @@
 use diesel::ConnectionResult;
 use diesel_async::AsyncPgConnection;
-use futures::{future, TryFutureExt};
+use futures::{future, FutureExt, TryFutureExt};
 use tracing::debug;
 use tracing::warn;
 
@@ -9,7 +9,7 @@ pub enum CertError {
     #[error("no PEM encoded data found in provided source")]
     Missing,
 
-    #[error("Failed to read PEM certificate: {0}")]
+    #[error("reading PEM cert: {0}")]
     Io(std::io::Error),
 
     #[error("Expected to parse X509-certificate, but found {0}")]
@@ -45,19 +45,25 @@ impl SslManager {
         self.root_certs.push(cert);
     }
 
+    /// Converts self into setup function that can be used by diesel_async::AsyncDieselConnectionManager.
+    /// Panics if any of the root certs contains invalid data.
     pub fn into_setup(
         self,
     ) -> impl Fn(&str) -> future::BoxFuture<'_, ConnectionResult<diesel_async::AsyncPgConnection>>
            + Send
            + Sync
            + 'static {
+        let mut cert_store = rustls::RootCertStore::empty();
+        let certs = self.root_certs.into_iter().map(|c| c.0).collect::<Vec<_>>();
+
+        let (added, _) = cert_store.add_parsable_certificates(&certs);
+
+        if added != certs.len() {
+            // Checked by using add_root_pem_cert
+            panic!("One or more certificates are invalid");
+        }
+
         move |url| {
-            let mut cert_store = rustls::RootCertStore::empty();
-
-            for cert in &self.root_certs {
-                cert_store.add(cert).expect("Adding cert"); // Parsed with rustls_pem
-            }
-
             let config = rustls::ClientConfig::builder()
                 .with_safe_defaults()
                 .with_root_certificates(cert_store.clone())
@@ -80,7 +86,7 @@ impl SslManager {
                     AsyncPgConnection::try_from(client)
                 });
 
-            Box::pin(fut)
+            fut.boxed()
         }
     }
 }
