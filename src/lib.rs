@@ -4,7 +4,7 @@ use std::sync::OnceLock;
 use diesel::ConnectionResult;
 use diesel_async::AsyncPgConnection;
 use futures_util::Future;
-use rustls::RootCertStore;
+use rustls::{pki_types::CertificateDer, RootCertStore};
 use tracing::debug;
 use tracing::warn;
 
@@ -24,7 +24,7 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 #[derive(Default)]
 pub struct SslManager {
-    root_certs: Vec<rustls::Certificate>,
+    root_certs: Vec<CertificateDer<'static>>,
 }
 
 static CERT_STORE: OnceLock<RootCertStore> = OnceLock::new();
@@ -35,13 +35,15 @@ impl SslManager {
         let mut bs = pem_cert.as_bytes();
 
         match rustls_pemfile::read_one(&mut bs) {
-            Ok(Some(rustls_pemfile::Item::X509Certificate(bs))) => {
-                self.root_certs.push(rustls::Certificate(bs));
+            Ok(Some(rustls_pemfile::Item::X509Certificate(cert))) => {
+                self.root_certs.push(cert);
                 Ok(self)
             }
-            Ok(Some(rustls_pemfile::Item::RSAKey(_))) => Err(CertError::WrongPEMKind("RSAKey")),
-            Ok(Some(rustls_pemfile::Item::PKCS8Key(_))) => Err(CertError::WrongPEMKind("PKCS8Key")),
-            Ok(Some(rustls_pemfile::Item::ECKey(_))) => Err(CertError::WrongPEMKind("ECKey")),
+            Ok(Some(rustls_pemfile::Item::Pkcs1Key(_))) => Err(CertError::WrongPEMKind("RSAKey")),
+            Ok(Some(rustls_pemfile::Item::Pkcs8Key(_))) => Err(CertError::WrongPEMKind("PKCS8Key")),
+            Ok(Some(rustls_pemfile::Item::Sec1Key(_))) => Err(CertError::WrongPEMKind("ECKey")),
+            Ok(Some(rustls_pemfile::Item::Crl(_))) => Err(CertError::WrongPEMKind("Crl")),
+            Ok(Some(rustls_pemfile::Item::Csr(_))) => Err(CertError::WrongPEMKind("Csr")),
             Ok(Some(_)) => Err(CertError::WrongPEMKind("other")),
             Ok(None) => Err(CertError::Missing),
 
@@ -49,16 +51,9 @@ impl SslManager {
         }
     }
 
-    pub fn add_root_cert(mut self, cert: rustls::Certificate) -> Self {
-        self.root_certs.push(cert);
-        self
-    }
-
     pub fn try_init(self) -> Result<(), RootCertStore> {
         let mut cert_store = RootCertStore::empty();
-        let certs = self.root_certs.into_iter().map(|c| c.0).collect::<Vec<_>>();
-
-        let (added, ignored) = cert_store.add_parsable_certificates(&certs);
+        let (added, ignored) = cert_store.add_parsable_certificates(self.root_certs);
 
         if added == 0 {
             warn!("No certificates were added");
@@ -77,7 +72,6 @@ pub fn setup_callback(url: &str) -> BoxFuture<'_, ConnectionResult<AsyncPgConnec
         })?;
 
         let config = rustls::ClientConfig::builder()
-            .with_safe_defaults()
             .with_root_certificates(certs.clone())
             .with_no_client_auth();
 
