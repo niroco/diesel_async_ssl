@@ -1,12 +1,10 @@
-use std::pin::Pin;
-use std::sync::OnceLock;
+use std::{pin::Pin, sync::OnceLock};
 
 use diesel::ConnectionResult;
 use diesel_async::AsyncPgConnection;
 use futures_util::Future;
 use rustls::{pki_types::CertificateDer, RootCertStore};
-use tracing::debug;
-use tracing::warn;
+use tracing::{debug, warn};
 
 #[derive(Debug, thiserror::Error)]
 pub enum CertError {
